@@ -1,197 +1,250 @@
-import sqlite3
+"""Render the collection as a static HTML page.
+
+Movie posters are referenced through their on-disk path (``images/movies/<file>``
+relative to the site folder); music cover art is embedded as a data URI because
+several tracks usually share the same album image.
+"""
+from __future__ import annotations
+
 import base64
-import json
 from html import escape
+from pathlib import Path
+from typing import Any
 
-def main(html_name: str, db_path: str, top_n: int):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+from lib.db.crud import retrieve_records_by_column
+from lib.db.models import Movie, Music
+from lib.db.session import get_session
+from lib.media import guess_image_mime
 
-    # ----MOVIES----
-    cursor.execute('SELECT * FROM movies ORDER BY rating DESC')
-    movies = cursor.fetchall()
+_STYLE = """
+* { box-sizing: border-box; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+    margin: 0;
+    padding: 24px;
+    background: #f5f5f5;
+    color: #1c1c1c;
+}
+h1 { margin: 0 0 20px; font-size: 28px; }
+.tabs { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
+.tab-btn {
+    padding: 8px 14px;
+    border-radius: 8px;
+    border: 1px solid #ccc;
+    background: #fff;
+    cursor: pointer;
+    font-size: 14px;
+}
+.tab-btn.active { background: #1c1c1c; border-color: #1c1c1c; color: #fff; }
+.count { opacity: .65; font-size: 12px; margin-left: 4px; }
+.section { display: none; }
+.section.active { display: block; }
+.container {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 20px;
+}
+.card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px;
+    background: #fff;
+    border: 1px solid #e2e2e2;
+    border-radius: 10px;
+}
+.card h3 {
+    margin: 0;
+    font-size: 15px;
+    line-height: 1.25;
+    height: 2.5em;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+}
+.poster {
+    width: 100%;
+    aspect-ratio: 2 / 3;
+    object-fit: cover;
+    border-radius: 6px;
+    background: #eee;
+    display: block;
+}
+.card--music .poster { aspect-ratio: 1 / 1; }
+.poster--empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px dashed #d0d0d0;
+    color: #999;
+    font-size: 12px;
+}
+.card p { margin: 0; font-size: 13px; }
+.muted { color: #666; }
+@media (max-width: 520px) {
+    .container { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; }
+    body { padding: 16px; }
+}
+"""
 
-    # ----MUSIC: только с album_art (не NULL и не пустой)----
-    cursor.execute('''
-        SELECT * FROM music
-        WHERE album_art IS NOT NULL AND LENGTH(album_art) > 0
-        ORDER BY rating DESC
-    ''')
-    music_rows = cursor.fetchall()
+_SCRIPT = """
+document.querySelectorAll('.tab-btn').forEach((button) => {
+    button.addEventListener('click', () => {
+        document.querySelectorAll('.tab-btn').forEach((item) => item.classList.remove('active'));
+        document.querySelectorAll('.section').forEach((section) => section.classList.remove('active'));
+        button.classList.add('active');
+        const target = document.getElementById(button.dataset.target);
+        if (target) {
+            target.classList.add('active');
+        }
+    });
+});
+"""
 
-    conn.close()
 
-    def album_art_data_uri(blob_bytes):
-        if not blob_bytes:
-            return None
-        b64 = base64.b64encode(blob_bytes).decode('ascii')
-        return f"data:image/jpeg;base64,{b64}"  # предполагаем jpeg; если PNG — можно детектировать
+def _format_number(value: Any) -> str | None:
+    if value is None:
+        return None
+    number = float(value)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.2f}".rstrip("0").rstrip(".")
 
-    # HTML generation
-    html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <title>My Collection</title>
-        <style>
-            body {{
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
-                margin: 20px;
-                background-color: #f5f5f5;
-            }}
-            .tabs {{
-                display:flex;
-                gap:8px;
-                margin-bottom:16px;
-            }}
-            .tab-btn {{
-                padding:8px 12px;
-                border-radius:6px;
-                border:1px solid #ccc;
-                background:#fff;
-                cursor:pointer;
-            }}
-            .tab-btn.active {{
-                background:#222;
-                color:#fff;
-            }}
-            .section {{ display:none; }}
-            .section.active {{ display:block; }}
 
-            .container {{
-                display: flex;
-                flex-wrap: wrap;
-                gap: 20px;
-                padding: 10px 0;
-                align-items: flex-start;
-            }}
+def _data_uri(blob: bytes | None) -> str | None:
+    if not blob:
+        return None
+    mime = guess_image_mime(blob)
+    if mime is None:
+        return None
+    encoded = base64.b64encode(blob).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
 
-            .card {{
-                width: 200px;
-                border: 1px solid #ccc;
-                padding: 12px;
-                border-radius: 5px;
-                text-align: center;
-                background: #fff;
-                display:flex;
-                flex-direction:column;
-                align-items:center;
-                min-height: 456.666px;
-            }}
 
-            .card h3 {{
-                margin: 0 0 8px 0;
-                font-size: 15px;
-                line-height: 1.2;
-                height: 2.4em;
-                overflow: hidden;
-                display: -webkit-box;
-                -webkit-line-clamp: 2;
-                -webkit-box-orient: vertical;
-            }}
+def _poster_src(movie: Movie, html_dir: Path) -> str | None:
+    """Return the poster path if the file exists next to the generated page."""
+    if not movie.poster_path:
+        return None
+    relative = Path(movie.poster_path)
+    if relative.is_absolute():
+        return None
+    if (html_dir / relative).is_file():
+        return movie.poster_path
+    return None
 
-            .card img {{
-                width: 100%;
-                height: auto;
-                margin-bottom: 10px;
-                object-fit: cover;
-                display:block;
-                border-radius:3px;
-            }}
 
-            .card p {{ margin:6px 0; font-size:13px; color:#222; }}
-            @media (max-width:520px) {{ .card {{ width:48%; }} }}
-            @media (max-width:360px) {{ .card {{ width:100%; }} }}
-        </style>
-    </head>
-    <body>
-        <h1>My Collection</h1>
+def _movie_card(movie: Movie, html_dir: Path) -> str:
+    title = escape(movie.title or "", quote=True)
+    year = f" ({movie.year})" if movie.year else ""
+    lines = ["    <article class=\"card\">", f"      <h3>{title}{year}</h3>"]
 
-        <div class="tabs">
-            <button class="tab-btn active" data-target="movies">Movies</button>
-            <button class="tab-btn" data-target="music">Music</button>
-        </div>
+    poster = _poster_src(movie, html_dir)
+    if poster:
+        lines.append(
+            f'      <img class="poster" src="{escape(poster, quote=True)}" '
+            f'alt="{title} poster" loading="lazy" decoding="async">'
+        )
+    else:
+        lines.append('      <div class="poster poster--empty" aria-hidden="true">no poster</div>')
 
-        <div id="movies" class="section active">
-            <div class="container">
-    """
+    rating = _format_number(movie.rating)
+    if rating:
+        lines.append(f"      <p><b>My rating:</b> {rating} / 10</p>")
+    imdb = _format_number(movie.imdb_rating)
+    if imdb:
+        lines.append(f"      <p><b>IMDb:</b> {imdb} / 10</p>")
+    if movie.title_type:
+        lines.append(f'      <p class="muted">{escape(movie.title_type, quote=True)}</p>')
+    if movie.genres:
+        lines.append(f'      <p class="muted">{escape(movie.genres, quote=True)}</p>')
 
-    # Movies section (limit top_n)
-    limit = 0
-    for movie in movies:
-        title = escape(str(movie[1])) if movie[1] is not None else ""
-        poster = escape(str(movie[2])) if movie[2] is not None else ""
-        year = escape(str(movie[3])) if len(movie) > 3 and movie[3] is not None else ""
-        imdb = escape(str(movie[4])) if len(movie) > 4 and movie[4] is not None else ""
-        myrating = escape(str(movie[5])) if len(movie) > 5 and movie[5] is not None else ""
-        genres = escape(str(movie[7])) if len(movie) > 7 and movie[7] is not None else ""
+    lines.append("    </article>")
+    return "\n".join(lines)
 
-        html_content += f"""
-                <div class="card">
-                    <h3>{title} ({year})</h3>
-                    <img src="{poster}" alt="{title} Poster" onerror="this.style.display='none'">
-                    <p><b>My Rating:</b> {myrating} / 10</p>
-                    <p><b>IMDb:</b> {imdb} / 10</p>
-                    <p><b>Genres:</b> {genres}</p>
-                </div>
-        """
-        limit += 1
-        if limit == top_n:
-            break
 
-    html_content += """
-            </div>
-        </div>
+def _music_card(track: Music) -> str:
+    title = escape(track.title or "", quote=True)
+    lines = ['    <article class="card card--music">', f"      <h3>{title}</h3>"]
 
-        <div id="music" class="section">
-            <div class="container">
-    """
+    art = _data_uri(track.album_art)
+    if art:
+        lines.append(
+            f'      <img class="poster" src="{art}" alt="{title} cover" '
+            f'loading="lazy" decoding="async">'
+        )
+    else:
+        lines.append('      <div class="poster poster--empty" aria-hidden="true">no cover</div>')
 
-    # Music section (limit top_n)
-    limit = 0
-    for m in music_rows:
-        # music schema: id, title, album, artist, album_art (bytes), rating, metadata_json
-        m_id = m[0]
-        m_title = escape(str(m[1])) if m[1] is not None else ""
-        m_album = escape(str(m[2])) if m[2] is not None else ""
-        m_artist = escape(str(m[3])) if m[3] is not None else ""
-        m_album_art_blob = m[4]
-        m_rating = escape(str(m[5])) if len(m) > 5 and m[5] is not None else ""
+    if track.artist:
+        lines.append(f'      <p><b>Artist:</b> {escape(track.artist, quote=True)}</p>')
+    if track.album:
+        lines.append(f'      <p><b>Album:</b> {escape(track.album, quote=True)}</p>')
+    rating = _format_number(track.rating)
+    if rating:
+        lines.append(f"      <p><b>Rating:</b> {rating} / 5</p>")
 
-        data_uri = album_art_data_uri(m_album_art_blob)
-        img_tag = f'<img src="{data_uri}" alt="{m_title} Album Art">' if data_uri else ''
+    lines.append("    </article>")
+    return "\n".join(lines)
 
-        html_content += f"""
-                <div class="card">
-                    <h3>{m_title}</h3>
-                    {img_tag}
-                    <p><b>Artist:</b> {m_artist}</p>
-                    <p><b>Album:</b> {m_album}</p>
-                    <p><b>Rating:</b> {m_rating}</p>
-                </div>
-        """
-        limit += 1
-        if limit == top_n:
-            break
 
-    html_content += """
-            </div>
-        </div>
+def main(html_name: str, db_path: str, top_n: int = 50) -> dict[str, Any]:
+    """Write the HTML page and return a small report about the generated content."""
+    output = Path(html_name)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    html_dir = output.resolve().parent
 
-        <script>
-            document.querySelectorAll('.tab-btn').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-                    document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
-                    btn.classList.add('active');
-                    document.getElementById(btn.dataset.target).classList.add('active');
-                });
-            });
-        </script>
-    </body>
-    </html>
-    """
+    with get_session(db_path) as session:
+        movie_rows = retrieve_records_by_column(session, Movie, "rating", None, descending=True)
+        music_rows = retrieve_records_by_column(session, Music, "rating", None, descending=True)
 
-    with open(html_name, "w", encoding="utf-8") as f:
-        f.write(html_content)
+        if top_n and top_n > 0:
+            movie_rows = movie_rows[:top_n]
+            music_rows = music_rows[:top_n]
+
+        movie_cards = [_movie_card(movie, html_dir) for movie in movie_rows]
+        music_cards = [_music_card(track) for track in music_rows]
+
+    parts = [
+        "<!DOCTYPE html>",
+        '<html lang="en">',
+        "<head>",
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        "<title>My Collection</title>",
+        f"<style>{_STYLE}</style>",
+        "</head>",
+        "<body>",
+        "<h1>My Collection</h1>",
+        '<div class="tabs">',
+        (
+            '  <button class="tab-btn active" type="button" data-target="movies">'
+            f'Movies <span class="count">{len(movie_cards)}</span></button>'
+        ),
+        (
+            '  <button class="tab-btn" type="button" data-target="music">'
+            f'Music <span class="count">{len(music_cards)}</span></button>'
+        ),
+        "</div>",
+        '<section id="movies" class="section active">',
+        '  <div class="container">',
+        "\n".join(movie_cards),
+        "  </div>",
+        "</section>",
+        '<section id="music" class="section">',
+        '  <div class="container">',
+        "\n".join(music_cards),
+        "  </div>",
+        "</section>",
+        f"<script>{_SCRIPT}</script>",
+        "</body>",
+        "</html>",
+    ]
+
+    output.write_text("\n".join(parts), encoding="utf-8")
+    return {
+        "path": str(output),
+        "movies": len(movie_cards),
+        "music": len(music_cards),
+        "bytes": output.stat().st_size,
+    }

@@ -5,3 +5,4 @@ Pillow==12.2.0
 python-dotenv==1.2.2
 Requests==2.33.1
 SQLAlchemy==2.0.49
+alembic==1.14.0

@@ -1,94 +1,163 @@
-from .models import Movie
+"""Thin, strict CRUD helpers built on top of SQLAlchemy sessions."""
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import Any, TypeVar
+
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import class_mapper
+from sqlalchemy.orm import Session, class_mapper
+
+T = TypeVar("T")
 
 
-def create_movie(session, **kwargs):
-    """
-    Create and persist a new Movie record.
+def _model_column_names(model: type[T]) -> set[str]:
+    """Return the set of mapped column names for a model class."""
+    return {column.key for column in class_mapper(model).columns}
 
-    Parameters:
-      session (Session): SQLAlchemy session used to add/flush the object.
-      **kwargs: Movie fields (e.g., title='Inception', year=2010).
 
-    Behavior:
-      - Instantiates Movie(**kwargs) and adds it to the session.
-      - Calls session.flush() to push pending changes and obtain DB-assigned values (like id)
-        and to surface integrity errors early.
-      - On IntegrityError, rolls back the session and re-raises the exception so callers
-        can handle it.
-      - Returns the Movie instance (attached to the session). Note: the instance may be
-        in a partially flushed state until session.commit() is called.
+def _validate_kwargs(
+    model: type[T],
+    data: Mapping[str, Any],
+    *,
+    allow_id: bool = False,
+) -> dict[str, Any]:
+    """Validate that every key in ``data`` is a mapped column of ``model``."""
+    payload = dict(data)
+    valid_fields = _model_column_names(model)
+    unknown_fields = sorted(set(payload.keys()) - valid_fields)
+    if unknown_fields:
+        raise ValueError(f"Invalid fields for {model.__name__}: {', '.join(unknown_fields)}")
+    if not allow_id and "id" in payload:
+        raise ValueError(f"'id' must not be provided for {model.__name__}")
+    return payload
 
-    Raises:
-      IntegrityError: if a DB constraint is violated during flush.
-    """
-    movie = Movie(**kwargs)
-    session.add(movie)
+
+def create_record(session: Session, model: type[T], **kwargs: Any) -> T:
+    """Create and flush a new record."""
+    payload = _validate_kwargs(model, kwargs)
+    record = model(**payload)
+    session.add(record)
     try:
-        session.flush()  # to get id and catch errors
+        session.flush()
     except IntegrityError:
         session.rollback()
         raise
-    return movie
+    return record
 
-def get_movie_by_title(session, title):
-    """
-    Retrieve a single Movie by title.
 
-    Parameters:
-      session (Session): SQLAlchemy session for querying.
-      title (str): Movie title to match.
+def find_one(session: Session, model: type[T], **filters: Any) -> T | None:
+    """Return the first record matching all ``filters`` (``None`` matches SQL NULL)."""
+    if not filters:
+        raise ValueError("At least one filter is required")
+    payload = _validate_kwargs(model, filters)
+    query = session.query(model)
+    for key, value in payload.items():
+        column = getattr(model, key)
+        query = query.filter(column.is_(None) if value is None else column == value)
+    return query.order_by(model.id).first()
 
-    Returns:
-      Movie | None: The first Movie with a matching title, or None if not found.
 
-    Notes:
-      - Uses a simple equality filter. If titles are not unique, this returns the first match.
-      - For case-insensitive matching, normalize title or use appropriate SQL functions.
-    """
-    return session.query(Movie).filter(Movie.title == title).first()
-
-def upsert_movie(session, match_by_title, **kwargs):
-    """
-    Insert a new Movie or update an existing one by title.
-
-    Parameters:
-      session (Session): SQLAlchemy session used for querying and persisting.
-      match_by_title (str): Title used to find an existing Movie.
-      **kwargs: Fields to set on the Movie (used for both create and update).
+def upsert_by(
+    session: Session,
+    model: type[T],
+    filters: Mapping[str, Any],
+    **values: Any,
+) -> tuple[T, bool]:
+    """Update the record matching ``filters`` or create it with ``filters`` + ``values``.
 
     Returns:
-      tuple(Movie, bool): (movie_instance, created)
-        - movie_instance: the Movie object attached to the session.
-        - created (bool): True if a new Movie was created, False if an existing one was updated.
-
-    Behavior:
-      - Attempts to find an existing Movie via get_movie_by_title().
-      - If found, updates attributes from kwargs, re-adds the object to the session, and returns it with created=False.
-      - If not found, constructs Movie(**kwargs), adds it to the session, and returns it with created=True.
-
-    Notes:
-      - This is a simple application-level upsert and is not atomic. Concurrent callers may
-        create duplicates if run in parallel. For safe concurrency use a database-level upsert
-        (e.g., INSERT ... ON CONFLICT / upsert APIs) or run inside a transaction with appropriate locks.
-      - Callers should commit the session to persist changes.
+        ``(record, created)`` where ``created`` is True for a new row.
     """
-    allowed = {c.key for c in class_mapper(Movie).columns} - {"id"}
-    # TODO: Check this T^2 algo latter
-    good = {k: v for k, v in kwargs.items() if k in allowed}
-    bad = [k for k in kwargs.keys() if k not in allowed]
-    
-    if bad:
-        print(f"Skipped fields not in Movie model: {', '.join(bad)}")
-    
-    obj = get_movie_by_title(session, match_by_title)
-    if obj:
-        for k, v in good.items():
-            setattr(obj, k, v)
-        session.add(obj)
-        return obj, False
-    else:
-        obj = Movie(**good)
-        session.add(obj)
-        return obj, True
+    filter_payload = _validate_kwargs(model, filters)
+    values_payload = _validate_kwargs(model, values)
+    record = find_one(session, model, **filter_payload)
+    if record is not None:
+        changed = {
+            key: value
+            for key, value in values_payload.items()
+            if getattr(record, key) != value
+        }
+        if changed:
+            update_record(session, record, **changed)
+        return record, False
+
+    record = create_record(session, model, **{**filter_payload, **values_payload})
+    return record, True
+
+
+def upsert_record(
+    session: Session,
+    model: type[T],
+    match_by_title: str,
+    **kwargs: Any,
+) -> tuple[T, bool]:
+    """Upsert a record by ``title`` (kept for backwards compatibility)."""
+    return upsert_by(session, model, {"title": match_by_title}, **kwargs)
+
+
+def batch_insert(
+    session: Session,
+    model: type[T],
+    records: Sequence[Mapping[str, Any]],
+) -> list[T]:
+    """Insert multiple records in one batched flush."""
+    payloads: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        try:
+            payloads.append(_validate_kwargs(model, record))
+        except ValueError as exc:
+            raise ValueError(f"Invalid record at index {index}: {exc}") from exc
+
+    if not payloads:
+        return []
+
+    objs = [model(**payload) for payload in payloads]
+    session.add_all(objs)
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise
+    return objs
+
+
+def retrieve_record_by_title(session: Session, model: type[T], title: str) -> T | None:
+    """Return the first record with a matching ``title``."""
+    if "title" not in _model_column_names(model):
+        raise ValueError(f"Model {model.__name__} has no 'title' column")
+    return find_one(session, model, title=title)
+
+
+def retrieve_records_by_column(
+    session: Session,
+    model: type[T],
+    column: str,
+    limit: int | None = None,
+    *,
+    descending: bool = True,
+) -> list[T]:
+    """Return records ordered by a mapped column, best values first by default."""
+    if column not in _model_column_names(model):
+        raise ValueError(f"Model {model.__name__} has no column '{column}'")
+    attribute = getattr(model, column)
+    ordering = attribute.desc() if descending else attribute.asc()
+    query = session.query(model).order_by(ordering, model.id.asc())
+    if limit and limit > 0:
+        query = query.limit(limit)
+    return query.all()
+
+
+def update_record(session: Session, record: T, **kwargs: Any) -> T:
+    """Update mapped fields on an existing record."""
+    payload = _validate_kwargs(type(record), kwargs)
+    for key, value in payload.items():
+        setattr(record, key, value)
+    session.add(record)
+    return record
+
+
+def delete_record(session: Session, record: T) -> bool:
+    """Delete the given record and flush the operation."""
+    session.delete(record)
+    session.flush()
+    return True

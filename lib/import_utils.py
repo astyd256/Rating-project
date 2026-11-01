@@ -3,11 +3,16 @@
 Poster files live in ``<site_folder>/images/movies`` and the database keeps the
 path relative to the site folder (``images/movies/<file>``), so the generated
 HTML can reference them directly.
+
+With ``sync=True`` the CSV is treated as the full desired list of movies:
+rows present in the file are inserted/updated, rows missing from it are
+deleted, and posters of deleted rows are removed from disk. Music is never
+touched.
 """
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -16,10 +21,12 @@ from sqlalchemy import inspect, text
 
 from lib.config import Config
 from lib.db import crud
+from lib.db.backup import backup_database
 from lib.db.engine import get_engine
 from lib.db.models import Movie
 from lib.db.session import get_session
 from lib.media import guess_image_mime, image_extension, slugify, unique_filename
+from lib.posters import prune_orphan_posters, referenced_poster_paths
 
 USER_AGENT = "rating-project/1.0"
 OMDB_TYPES = {
@@ -36,6 +43,10 @@ OMDB_TYPES = {
 }
 _EMPTY_VALUES = {"", "n/a", "na", "nan", "none", "null", "-"}
 
+# Refuse a sync that would delete more than half of the movie table. This
+# catches truncated or wrong CSV files; --force overrides it.
+MAX_DELETE_RATIO = 0.5
+
 
 @dataclass
 class ImportStats:
@@ -43,11 +54,18 @@ class ImportStats:
     updated: int = 0
     unchanged: int = 0
     skipped: int = 0
+    csv_rows: int = 0
     posters_downloaded: int = 0
+    deleted: int = 0
+    deleted_titles: list[str] = field(default_factory=list)
+    posters_deleted: int = 0
+    poster_files: list[str] = field(default_factory=list)
+    backup_path: str | None = None
+    dry_run: bool = False
 
     @property
     def total(self) -> int:
-        return self.inserted + self.updated + self.unchanged
+        return self.inserted + self.updated + self.unchanged + self.deleted
 
 
 def _clean(value: Any) -> str | None:
@@ -97,6 +115,18 @@ def _normalise_imdb_const(value: str | None) -> str | None:
     if const.isdigit():
         const = f"tt{const}"
     return const
+
+
+def _poster_relative(value: Any) -> str | None:
+    if not value:
+        return None
+    return str(value).replace("\\", "/").strip() or None
+
+
+def _movie_label(movie: Movie) -> str:
+    year = f" ({movie.year})" if movie.year else ""
+    const = f" [{movie.imdb_const}]" if movie.imdb_const else ""
+    return f"{movie.title}{year}{const}"
 
 
 def parse_csv_row(raw: Mapping[str, Any], data_type: str = "movie") -> dict[str, Any] | None:
@@ -320,16 +350,47 @@ def _ids_with_blob(db_path: str) -> set[int]:
         return {row[0] for row in rows}
 
 
+def _plan_deletions(existing: list[Movie], rows: list[dict[str, Any]]) -> list[Movie]:
+    """Return movies that are not part of the CSV (matched by IMDb id)."""
+    csv_consts = {
+        payload["imdb_const"]
+        for payload in rows
+        if payload.get("imdb_const")
+    }
+    # Rows without an IMDb id are kept: deleting them by title+year would be
+    # guesswork. All rows imported by this tool carry an id.
+    return [
+        movie
+        for movie in existing
+        if movie.imdb_const and movie.imdb_const not in csv_consts
+    ]
+
+
 def import_movies_csv(
     file_path: str | Path,
     config: Config,
     *,
     download_posters: bool = True,
     limit: int | None = None,
+    sync: bool = False,
+    dry_run: bool = False,
+    force: bool = False,
 ) -> ImportStats:
-    """Upsert movies from an IMDb CSV export."""
-    stats = ImportStats()
+    """Upsert movies from an IMDb CSV export.
+
+    Args:
+        sync: treat the CSV as the authoritative movie list and delete rows
+            that are missing from it.
+        dry_run: only compute the sync plan; no database or file changes.
+        force: allow a sync that deletes more than ``MAX_DELETE_RATIO`` of the
+            table (protection against truncated CSV files).
+    """
+    if dry_run and not sync:
+        raise ValueError("dry_run requires sync=True")
+
+    stats = ImportStats(dry_run=dry_run)
     rows = read_csv_movies(file_path, limit=limit)
+    stats.csv_rows = len(rows)
     if not rows:
         return stats
 
@@ -338,6 +399,46 @@ def import_movies_csv(
     http = requests.Session()
     http.headers.update({"User-Agent": USER_AGENT})
 
+    doomed: list[Movie] = []
+    existing_count = 0
+    if sync:
+        with get_session(str(config.db_path)) as session:
+            existing = session.query(Movie).all()
+        existing_count = len(existing)
+        doomed = _plan_deletions(existing, rows)
+        if doomed and not force and len(doomed) > max(1, int(existing_count * MAX_DELETE_RATIO)):
+            http.close()
+            raise RuntimeError(
+                f"Refusing to delete {len(doomed)} of {existing_count} movies "
+                f"(more than {int(MAX_DELETE_RATIO * 100)}%): check the CSV, "
+                "or pass --force if this is intentional."
+            )
+        stats.deleted = len(doomed)
+        stats.deleted_titles = [_movie_label(movie) for movie in doomed]
+        deleted_posters = [
+            path for movie in doomed if (path := _poster_relative(movie.poster_path))
+        ]
+
+        if dry_run:
+            referenced = referenced_poster_paths(config.db_path)
+            still_referenced = referenced - set(deleted_posters)
+            pending = [
+                path
+                for path in sorted(set(deleted_posters))
+                if path not in still_referenced
+                and (config.site_folder / path).is_file()
+            ]
+            stats.posters_deleted = len(pending)
+            stats.poster_files = pending
+            http.close()
+            return stats
+
+        if doomed:
+            stats.backup_path = str(backup_database(config.db_path))
+    else:
+        deleted_posters = []
+
+    touched: set[int] = set()
     with get_session(str(config.db_path)) as session:
         for payload in rows:
             record = _find_movie(session, payload)
@@ -355,6 +456,7 @@ def import_movies_csv(
                 if changes:
                     crud.update_record(session, record, **changes)
 
+            touched.add(record.id)
             has_blob = record.id in blob_ids
             poster_added = False
             if download_posters and not has_blob:
@@ -376,5 +478,32 @@ def import_movies_csv(
                     stats.unchanged += 1
             session.flush()
 
+        if sync and doomed:
+            delete_ids = [movie.id for movie in doomed if movie.id not in touched]
+            if delete_ids:
+                deleted_movies = (
+                    session.query(Movie).filter(Movie.id.in_(delete_ids)).all()
+                )
+                stats.deleted = len(deleted_movies)
+                stats.deleted_titles = [_movie_label(movie) for movie in deleted_movies]
+                deleted_posters = [
+                    path
+                    for movie in deleted_movies
+                    if (path := _poster_relative(movie.poster_path))
+                ]
+                for movie in deleted_movies:
+                    session.delete(movie)
+                session.flush()
+
     http.close()
+
+    if sync and deleted_posters:
+        pruned, count = prune_orphan_posters(
+            config.db_path,
+            config.site_folder,
+            only=set(deleted_posters),
+        )
+        stats.posters_deleted = count
+        stats.poster_files = pruned
+
     return stats

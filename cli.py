@@ -6,6 +6,7 @@ from commands.dedupe import main as dedupe
 from commands.export_posters import main as export_posters
 from commands.import_file import main as import_file
 from commands.import_music import main as import_music
+from commands.prune_posters import main as prune_posters
 from lib.config import load_config
 from lib.db.init import ensure_db
 
@@ -18,6 +19,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  python cli.py --init\n"
             "  python cli.py --import-file data/imdb_ratings.csv\n"
+            "  python cli.py --import-file data/imdb_ratings.csv --sync --dry-run\n"
+            "  python cli.py --import-file data/imdb_ratings.csv --sync\n"
             "  python cli.py --import-music \"D:/Music\"\n"
             "  python cli.py --create-html --top-n 100\n"
         ),
@@ -36,8 +39,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="merge movies that are duplicate (same title and year)",
     )
+    parser.add_argument(
+        "--prune-posters",
+        action="store_true",
+        help="delete files in images/movies that no movie references",
+    )
     parser.add_argument("--create-html", action="store_true", help="generate the static HTML site")
 
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        help="with --import-file: the CSV is the full list, delete movies missing from it",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="allow --sync to delete more than half of the movie table",
+    )
     parser.add_argument(
         "--data-type",
         default="movie",
@@ -64,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="show what --export-posters / --dedupe would change",
+        help="show what --sync / --export-posters / --dedupe / --prune-posters would change",
     )
 
     parser.add_argument("--db-path", help="override DB_PATH from .env")
@@ -87,6 +105,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.sync and not args.import_file:
+        parser.error("--sync requires --import-file")
+    if args.dry_run and args.import_file and not args.sync:
+        parser.error("--dry-run with --import-file requires --sync")
+
     selected = any(
         (
             args.init,
@@ -94,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             args.import_music,
             args.export_posters,
             args.dedupe,
+            args.prune_posters,
             args.create_html,
         )
     )
@@ -117,6 +141,9 @@ def main(argv: list[str] | None = None) -> int:
             config,
             args.data_type,
             download_posters=not args.no_posters,
+            sync=args.sync,
+            dry_run=args.dry_run,
+            force=args.force,
         )
         if code:
             return code
@@ -137,6 +164,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dedupe:
         code = dedupe(config, dry_run=args.dry_run)
+        if code:
+            return code
+
+    if args.prune_posters:
+        code = prune_posters(config, dry_run=args.dry_run)
         if code:
             return code
 

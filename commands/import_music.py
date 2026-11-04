@@ -13,6 +13,7 @@ def main(
         stats = import_music_folder(
             folder_path,
             str(config.db_path),
+            config.site_folder,
             block_without_rating=block_without_rating,
         )
     except FileNotFoundError as exc:
@@ -24,6 +25,6 @@ def main(
 
     print(
         f"Music: {stats.added} added, {stats.updated} updated, "
-        f"{stats.skipped} skipped without rating, {stats.errors} errors"
+        f"{stats.errors} errors"
     )
     return 0

@@ -17,12 +17,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import requests
-from sqlalchemy import inspect, text
 
 from lib.config import Config
 from lib.db import crud
 from lib.db.backup import backup_database
-from lib.db.engine import get_engine
 from lib.db.models import Movie
 from lib.db.session import get_session
 from lib.media import guess_image_mime, image_extension, slugify, unique_filename
@@ -53,7 +51,6 @@ class ImportStats:
     inserted: int = 0
     updated: int = 0
     unchanged: int = 0
-    skipped: int = 0
     csv_rows: int = 0
     posters_downloaded: int = 0
     deleted: int = 0
@@ -339,17 +336,6 @@ def _ensure_poster(
     return False
 
 
-def _ids_with_blob(db_path: str) -> set[int]:
-    """Return movie ids whose legacy ``poster_blob`` column has data."""
-    engine = get_engine(db_path)
-    columns = {column["name"] for column in inspect(engine).get_columns("movies")}
-    if "poster_blob" not in columns:
-        return set()
-    with engine.connect() as connection:
-        rows = connection.execute(text("SELECT id FROM movies WHERE poster_blob IS NOT NULL"))
-        return {row[0] for row in rows}
-
-
 def _plan_deletions(existing: list[Movie], rows: list[dict[str, Any]]) -> list[Movie]:
     """Return movies that are not part of the CSV (matched by IMDb id)."""
     csv_consts = {
@@ -395,7 +381,6 @@ def import_movies_csv(
         return stats
 
     image_dir = config.movies_image_dir
-    blob_ids = _ids_with_blob(str(config.db_path))
     http = requests.Session()
     http.headers.update({"User-Agent": USER_AGENT})
 
@@ -457,9 +442,8 @@ def import_movies_csv(
                     crud.update_record(session, record, **changes)
 
             touched.add(record.id)
-            has_blob = record.id in blob_ids
             poster_added = False
-            if download_posters and not has_blob:
+            if download_posters:
                 poster_added = _ensure_poster(
                     session,
                     record,

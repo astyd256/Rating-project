@@ -1,9 +1,12 @@
 .env
 *.db
+*.db.bak-*
+*.sqlite3
 *.html
 data/
 venv/
-__pycache__
+.venv/
+__pycache__/
 .vscode
 .cursor
 personal-site/

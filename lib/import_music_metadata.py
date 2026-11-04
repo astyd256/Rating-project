@@ -1,6 +1,7 @@
 """Import music metadata (title, album, artist, rating, cover art) from audio files."""
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass
 from io import BytesIO
@@ -15,6 +16,7 @@ from PIL import Image
 from lib.db import crud
 from lib.db.models import Music
 from lib.db.session import get_session
+from lib.media import image_extension
 
 SUPPORTED_EXTENSIONS = {
     ".mp3",
@@ -40,7 +42,6 @@ _POPM_STARS = ((0, 0.0), (1, 1.0), (64, 2.0), (128, 3.0), (196, 4.0), (255, 5.0)
 class MusicImportStats:
     added: int = 0
     updated: int = 0
-    skipped: int = 0
     errors: int = 0
 
 
@@ -309,6 +310,7 @@ def extract_metadata(file_path: str | Path) -> dict[str, Any]:
 def import_music_folder(
     folder_path: str | Path,
     db_path: str,
+    site_folder: str | Path,
     *,
     block_without_rating: bool = True,
     limit: int | None = None,
@@ -320,6 +322,7 @@ def import_music_folder(
 
     stats = MusicImportStats()
     entries: list[dict[str, Any]] = []
+    image_dir = Path(site_folder) / "images" / "music"
 
     for directory, dirnames, filenames in os.walk(root):
         dirnames.sort()
@@ -334,7 +337,6 @@ def import_music_folder(
                 continue
 
             if block_without_rating and meta.get("rating") is None:
-                stats.skipped += 1
                 continue
 
             entries.append(meta)
@@ -357,7 +359,14 @@ def import_music_folder(
             if meta.get("rating") is not None:
                 values["rating"] = round(float(meta["rating"]), 2)
             if meta.get("art"):
-                values["album_art"] = meta["art"]
+                data = bytes(meta["art"])
+                digest = hashlib.sha1(data).hexdigest()[:20]
+                filename = f"{digest}{image_extension(data)}"
+                image_dir.mkdir(parents=True, exist_ok=True)
+                target = image_dir / filename
+                if not target.is_file():
+                    target.write_bytes(data)
+                values["poster_path"] = f"images/music/{filename}"
 
             _, created = crud.upsert_by(session, Music, filters, **values)
             if created:

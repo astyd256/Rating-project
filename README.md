@@ -6,6 +6,7 @@ SQLite database and rendering them as a static site.
 - [TL;DR](#tldr)
 - [Usage](#usage)
 - [Commands](#commands)
+- [Last.fm widget](#lastfm-widget)
 - [Keeping the movie list in sync](#keeping-the-movie-list-in-sync)
 - [How data is stored](#how-data-is-stored)
 - [Supported services](#supported-services)
@@ -20,7 +21,8 @@ SQLite database and rendering them as a static site.
   file are deleted (with an automatic database backup).
 - Music metadata (title, album, artist, rating, cover art) is read from audio
   tags with `mutagen`.
-- `--create-html` renders a single static page with lazy-loaded posters.
+- `--create-html` renders a single static page with lazy-loaded posters and an
+  optional Last.fm "now playing" widget.
 
 ## Usage
 
@@ -56,6 +58,9 @@ OMDB_API_KEY=your-key
 OMDB_URL=https://www.omdbapi.com/
 SITE_FOLDER=personal-site
 DB_PATH=personal-site/ratings.db
+LASTFM_USER=your_username
+LASTFM_API_KEY=your-lastfm-key
+LASTFM_REFRESH_SECONDS=60
 ```
 
 ## Commands
@@ -76,9 +81,12 @@ python cli.py --import-music "D:/Music"
 # include tracks without a rating as well
 python cli.py --import-music "D:/Music" --no-block-no-star-music
 
-# one-time maintenance: move old poster BLOBs to files and fix stored paths
-python cli.py --export-posters --dry-run
-python cli.py --export-posters
+# games from a Yamtrack CSV export (only rated rows are imported)
+python cli.py --import-games data/yamtrack.csv
+
+# anime / manga from MyAnimeList-format XML exports
+python cli.py --import-anime data/animes.xml
+python cli.py --import-manga data/mangas.xml
 
 # merge duplicate movies (same title + year), dry run first
 python cli.py --dedupe --dry-run
@@ -88,12 +96,40 @@ python cli.py --dedupe
 python cli.py --prune-posters --dry-run
 python cli.py --prune-posters
 
-# generate the site (50 cards per section by default, 0 = all)
+# generate the site (30 cards per section by default, 0 = all)
 python cli.py --create-html
+python cli.py --create-html --top-n 50
 python cli.py --create-html --top-n 0
+
+# doujin and light novels are hidden from the Manga tab by default;
+# show them explicitly (or use 'all')
+python cli.py --create-html --top-n 30 --include-manga-types doujin,light_novel
 ```
 
+`--include-manga-types` affects only the generated HTML: doujin and light novels
+stay in the database either way.
+
 `--db-path`, `--site-folder` and `--html-path` override `.env` for a single run.
+
+## Last.fm widget
+
+The generated page can show the track you are listening to right now in the
+top-right corner. Last.fm does not provide official embeds, so the page calls
+the public [`user.getRecentTracks`](https://www.last.fm/api/show/user.getRecentTracks)
+API directly from the browser.
+
+Create a free API key at [last.fm/api/account/create](https://www.last.fm/api/account/create)
+(no callback URL is needed for read-only methods) and fill in `.env`
+Then rebuild the site with `--create-html`. The widget:
+
+- shows cover, track and artist, plus `now playing` or `last played <time>`;
+- clicking the widget opens your Last.fm profile;
+- refreshes once a minute and pauses while the tab is hidden;
+- backs off on errors and stays hidden if the account/key is unavailable;
+- becomes a normal block under the heading on narrow screens.
+
+The API key is visible in the HTML (it only grants read access to public data).
+If that is not acceptable, put a small caching proxy in front of the API instead.
 
 ## Keeping the movie list in sync
 
@@ -134,21 +170,28 @@ poster paths — use `--sync` instead.
 - `movies.poster_path` holds a path relative to the site folder, for example
   `images/movies/the-matrix-1999.jpg`. The file itself lives in
   `personal-site/images/movies/`.
-- Legacy databases keep the raw image bytes in `movies.poster_blob`; run
-  `--export-posters` once to turn them into files.
-- Music cover art is resized to a 240 px webp and embedded into the page as a
-  data URI, because many tracks share one album image.
-- Ratings: movies are 0–10, music is 0–5 stars (the POPM value written by
-  MusicBee is mapped to the nearest star value).
+- Games, anime and manga use the same scheme with
+  `images/games/`, `images/anime/` and `images/manga/`.
+- Doujin and light-novel manga stay in the database but are hidden from the
+  Manga tab unless `--include-manga-types` asks for them.
+- Game covers come from the Yamtrack export (IGDB URLs); anime/manga covers are
+  looked up on Shikimori by MAL id (Jikan, then AniList, are fallbacks).
+- Music covers live in `images/music/<sha1>.webp` (or `.jpg`/`.png`); identical
+  covers are written once and shared by all tracks of the album.
+- Ratings: movies, games, anime and manga are 0–10 (half points allowed);
+  music is 0–5 stars (the POPM value written by MusicBee is mapped to the
+  nearest star value).
 - Imports are idempotent: movies are matched by IMDb id and then by
-  `title` + `year`, music by `title` + `artist` + `album`.
+  `title` + `year`, music by `title` + `artist` + `album`, games by IGDB id,
+  anime/manga by MAL id.
 
 ## Supported services
 
 - Movies — IMDb CSV export (poster lookup through [OMDB](https://www.omdbapi.com/))
 - Music files — MP3/FLAC/M4A/WAV/OGG tags (MusicBee POPM ratings, FLAC pictures, MP4 covers)
-- Anime/Manga — **TBA** (Shikimori/MAL XML files are collected in `data/`)
-- Steam games — **TBA** (Yamtrack CSV and Steam exports are collected in `data/`)
+- Anime/Manga — MyAnimeList XML export (Shikimori), covers via Shikimori API
+  (Jikan/AniList fallback)
+- Games — Yamtrack CSV export (IGDB ids and covers)
 
 ## Features
 
@@ -159,12 +202,17 @@ poster paths — use `--sync` instead.
 - [x] Sync the movie table with an edited CSV (backup + dry-run)
 - [x] Download posters to `images/movies`
 - [x] Import music metadata and cover art
+- [x] Import rated games from Yamtrack CSV
+- [x] Import anime and manga from MAL XML (covers via Shikimori/Jikan/AniList)
+- [x] Music covers stored as deduplicated files
+- [x] Five site tabs: Movies, Music, Games, Anime, Manga
 - [x] Deduplicate movies by title + year
 - [x] Clean up orphan poster files
 - [x] Export a static HTML site
   - [x] Local poster files and lazy loading
+  - [x] IMDb links from `imdb_const`
+  - [x] Light/dark theme toggle (preference saved)
+  - [x] Optional Last.fm "now playing" widget
   - [ ] Lazy loading for very large collections
-- [ ] Import anime/manga (Shikimori XML/JSON)
-- [ ] Import games (Yamtrack CSV, IGDB posters)
 - [ ] Export to Markdown / JSON / IMDb CSV
 - [ ] Logger, automated tests

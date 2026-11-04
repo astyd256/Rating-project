@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Float, Integer, LargeBinary, REAL, String
+from sqlalchemy import Column, Float, Integer, REAL, String
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -30,6 +30,44 @@ class Music(Base):
     title = Column(String, nullable=False)
     album = Column(String, nullable=True)
     artist = Column(String, nullable=True)
-    # Compressed cover image (webp when possible, jpeg as a fallback).
-    album_art = Column(LargeBinary, nullable=True)
+    # Path relative to the site folder, e.g. "images/music/<hash>.webp".
+    poster_path = Column(String, nullable=True)
     rating = Column(REAL, nullable=True)
+
+
+class Game(Base):
+    __tablename__ = "games"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    external_id = Column(String(32), nullable=False, unique=True, index=True)
+    title = Column(String, nullable=False)
+    poster_url = Column(String, nullable=True)
+    poster_path = Column(String, nullable=True)
+    rating = Column(Float, nullable=True)
+
+
+class Anime(Base):
+    __tablename__ = "anime"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    mal_id = Column(Integer, nullable=False, unique=True, index=True)
+    title = Column(String, nullable=False)
+    title_type = Column(String, nullable=True)
+    episodes = Column(Integer, nullable=True)
+    poster_url = Column(String, nullable=True)
+    poster_path = Column(String, nullable=True)
+    rating = Column(Float, nullable=True)
+
+
+class Manga(Base):
+    __tablename__ = "manga"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    mal_id = Column(Integer, nullable=False, unique=True, index=True)
+    title = Column(String, nullable=False)
+    title_type = Column(String, nullable=True)
+    chapters = Column(Integer, nullable=True)
+    volumes = Column(Integer, nullable=True)
+    poster_url = Column(String, nullable=True)
+    poster_path = Column(String, nullable=True)
+    rating = Column(Float, nullable=True)

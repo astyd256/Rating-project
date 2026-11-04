@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from lib.config import Config
-from lib.import_utils import import_movies_csv
+from lib.import_movies import import_movies_csv
 
 ALLOWED_EXTENSIONS = {"csv"}
 
@@ -59,7 +59,7 @@ def main(
     else:
         print(
             f"Movies{mode}: {stats.inserted} added, {stats.updated} updated, "
-            f"{stats.unchanged} unchanged, {stats.skipped} skipped, "
+            f"{stats.unchanged} unchanged, "
             f"{stats.deleted} {deleted_label}"
         )
 

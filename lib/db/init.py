@@ -10,7 +10,7 @@ from sqlalchemy import inspect
 from lib.db.engine import get_engine, make_url
 from lib.db.models import Base
 
-REQUIRED_TABLES = {"movies", "music"}
+REQUIRED_TABLES = {"movies", "music", "games", "anime", "manga"}
 
 
 def ensure_db(path: str | Path) -> None:

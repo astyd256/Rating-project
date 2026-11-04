@@ -3,8 +3,8 @@ import sys
 
 from commands.create_html import main as create_html
 from commands.dedupe import main as dedupe
-from commands.export_posters import main as export_posters
 from commands.import_file import main as import_file
+from commands.import_media import main as import_media
 from commands.import_music import main as import_music
 from commands.prune_posters import main as prune_posters
 from lib.config import load_config
@@ -13,7 +13,7 @@ from lib.db.init import ensure_db
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Ratings CLI: import movies and music, keep posters on disk, build a static site.",
+        description="Ratings CLI: import movies, music, games, anime and manga; build a static site.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -22,6 +22,9 @@ def build_parser() -> argparse.ArgumentParser:
             "  python cli.py --import-file data/imdb_ratings.csv --sync --dry-run\n"
             "  python cli.py --import-file data/imdb_ratings.csv --sync\n"
             "  python cli.py --import-music \"D:/Music\"\n"
+            "  python cli.py --import-games data/yamtrack.csv\n"
+            "  python cli.py --import-anime data/animes.xml\n"
+            "  python cli.py --import-manga data/mangas.xml\n"
             "  python cli.py --create-html --top-n 100\n"
         ),
     )
@@ -29,11 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--init", action="store_true", help="create the database and apply migrations")
     parser.add_argument("--import-file", metavar="CSV", help="import rated movies from an IMDb CSV export")
     parser.add_argument("--import-music", metavar="FOLDER", help="scan a music folder and import tags/cover art")
-    parser.add_argument(
-        "--export-posters",
-        action="store_true",
-        help="move legacy poster blobs into <site>/images/movies",
-    )
+    parser.add_argument("--import-games", metavar="CSV", help="import rated games from a Yamtrack CSV export")
+    parser.add_argument("--import-anime", metavar="XML", help="import rated anime from a MAL XML export")
+    parser.add_argument("--import-manga", metavar="XML", help="import rated manga from a MAL XML export")
     parser.add_argument(
         "--dedupe",
         action="store_true",
@@ -64,8 +65,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--top-n",
         type=int,
-        default=50,
+        default=30,
         help="max cards per section in the generated HTML (0 = all)",
+    )
+    parser.add_argument(
+        "--include-manga-types",
+        metavar="LIST",
+        help=(
+            "comma-separated MAL manga types to show, e.g. doujin,light_novel "
+            "or 'all'; by default doujin and light_novel are hidden"
+        ),
     )
     parser.add_argument(
         "--block-no-star-music",
@@ -77,12 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-posters",
         action="store_true",
-        help="do not download posters while importing movies",
+        help="do not download posters while importing media",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="show what --sync / --export-posters / --dedupe / --prune-posters would change",
+        help="show what --sync / --dedupe / --prune-posters would change",
     )
 
     parser.add_argument("--db-path", help="override DB_PATH from .env")
@@ -115,7 +124,9 @@ def main(argv: list[str] | None = None) -> int:
             args.init,
             args.import_file,
             args.import_music,
-            args.export_posters,
+            args.import_games,
+            args.import_anime,
+            args.import_manga,
             args.dedupe,
             args.prune_posters,
             args.create_html,
@@ -132,7 +143,15 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # One bootstrap for every action that needs a working schema.
-    if args.init or args.import_file or args.import_music or args.create_html:
+    if (
+        args.init
+        or args.import_file
+        or args.import_music
+        or args.import_games
+        or args.import_anime
+        or args.import_manga
+        or args.create_html
+    ):
         ensure_db(config.db_path)
 
     if args.import_file:
@@ -157,8 +176,33 @@ def main(argv: list[str] | None = None) -> int:
         if code:
             return code
 
-    if args.export_posters:
-        code = export_posters(config, dry_run=args.dry_run)
+    if args.import_games:
+        code = import_media(
+            "games",
+            args.import_games,
+            config,
+            download_posters=not args.no_posters,
+        )
+        if code:
+            return code
+
+    if args.import_anime:
+        code = import_media(
+            "anime",
+            args.import_anime,
+            config,
+            download_posters=not args.no_posters,
+        )
+        if code:
+            return code
+
+    if args.import_manga:
+        code = import_media(
+            "manga",
+            args.import_manga,
+            config,
+            download_posters=not args.no_posters,
+        )
         if code:
             return code
 
@@ -173,7 +217,16 @@ def main(argv: list[str] | None = None) -> int:
             return code
 
     if args.create_html:
-        code = create_html(config, args.top_n)
+        include_manga_types = {
+            value.strip().lower()
+            for value in (args.include_manga_types or "").split(",")
+            if value.strip()
+        }
+        code = create_html(
+            config,
+            args.top_n,
+            include_manga_types=include_manga_types,
+        )
         if code:
             return code
 
